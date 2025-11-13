@@ -25,6 +25,9 @@ NEWS_LOOKBACK_DAYS = 30
 # Throttle between requests so we don't spam Finnhub
 SECONDS_BETWEEN_REQUESTS = 1.2
 
+# Env-var-controlled max articles (default 20)
+MAX_ARTICLES_PER_TICKER = int(os.getenv("MAX_ARTICLES_PER_TICKER", "20"))
+
 
 def col_letter(idx: int) -> str:
     """Convert 1-based column index to Excel-style letter."""
@@ -55,10 +58,7 @@ def get_gspread_worksheet() -> gspread.Worksheet:
 
 
 def ensure_headers(worksheet: gspread.Worksheet):
-    """
-    Ensure our headers exist in row 1 from column P onward.
-    Does NOT touch columns A–O.
-    """
+    """Ensure our headers exist from column P onward."""
     start_col_index = 16  # P
     end_col_index = start_col_index + len(HEADER_COLUMNS) - 1  # R
 
@@ -70,28 +70,15 @@ def ensure_headers(worksheet: gspread.Worksheet):
 
 
 def get_tickers(worksheet: gspread.Worksheet) -> list[str]:
-    """
-    Read tickers from column A, starting at row 2.
-    Row 1 is treated as header and ignored.
-    """
-    col_a = worksheet.col_values(1)  # column A
+    """Read tickers from column A, ignoring row 1."""
+    col_a = worksheet.col_values(1)
     if not col_a:
         return []
-
-    # Skip row 1 (header)
-    tickers = [value.strip().upper() for value in col_a[1:] if value.strip()]
-    return tickers
+    return [v.strip().upper() for v in col_a[1:] if v.strip()]
 
 
 def normalize_ticker_for_news(ticker: str) -> str:
-    """
-    Normalize symbols for Finnhub company-news.
-
-    Examples:
-      'BTC/USD' -> 'BTC'
-      'ETH-USD' -> 'ETH'
-      'SOLUSD'  -> 'SOLUSD'  (unchanged)
-    """
+    """Normalize tickers for Finnhub."""
     t = ticker.upper()
     if "/" in t:
         t = t.split("/")[0]
@@ -108,14 +95,8 @@ def compute_sentiment_for_ticker(
     days_back: int = NEWS_LOOKBACK_DAYS,
 ):
     """
-    Fetch recent company news from Finnhub for `ticker` and compute VADER sentiment.
-
-    Includes basic rate-limit handling: if we get 429, sleep until reset (or 60s)
-    and retry once.
-
-    Returns:
-        (compound_avg, article_count)
-        or (None, 0) if no usable news.
+    Fetch recent company news from Finnhub and compute VADER sentiment.
+    Applies MAX_ARTICLES_PER_TICKER limit.
     """
     today = datetime.utcnow().date()
     from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -132,13 +113,12 @@ def compute_sentiment_for_ticker(
 
     url = "https://finnhub.io/api/v1/company-news"
 
-    # Up to 2 attempts: initial + one retry if rate limited
+    # Allow up to 1 retry for 429 rate limits
     for attempt in range(2):
         try:
             resp = session.get(url, params=params, timeout=10)
 
             if resp.status_code == 429:
-                # Rate limited – look for reset header and sleep
                 reset_header = resp.headers.get("X-RateLimit-Reset")
                 if reset_header:
                     try:
@@ -151,38 +131,31 @@ def compute_sentiment_for_ticker(
                     wait_secs = 60
 
                 print(
-                    f"Rate limit hit for {ticker} ({symbol_for_news}), "
-                    f"sleeping {wait_secs}s before retry..."
+                    f"429 rate limit for {ticker} — sleeping {wait_secs}s then retrying..."
                 )
                 time.sleep(wait_secs)
-                # Go back to top of loop for retry (only once)
                 continue
 
             resp.raise_for_status()
             articles = resp.json()
-            break  # success, exit retry loop
+            break
 
-        except requests.HTTPError as e:
-            # If this wasn't 429 or we've already retried, bail out
-            print(f"HTTP error for {ticker} ({symbol_for_news}): {e}")
-            return None, 0
         except Exception as e:
-            print(f"Error fetching Finnhub news for {ticker} ({symbol_for_news}): {e}")
+            print(f"Error fetching Finnhub news for {ticker}: {e}")
             return None, 0
     else:
-        # If we exit the loop normally (no break), we never succeeded
         print(f"Failed to fetch Finnhub news for {ticker} after retries.")
         return None, 0
 
+    # No articles
     if not isinstance(articles, list) or not articles:
-        print(
-            f"No Finnhub company news for {ticker} ({symbol_for_news}) "
-            f"from {from_date} to {to_date}."
-        )
+        print(f"No news returned for {ticker}.")
         return None, 0
 
-    compounds = []
+    # Apply article limit
+    articles = articles[:MAX_ARTICLES_PER_TICKER]
 
+    compounds = []
     for article in articles:
         headline = (article.get("headline") or "").strip()
         summary = (article.get("summary") or "").strip()
@@ -193,20 +166,17 @@ def compute_sentiment_for_ticker(
         score = analyzer.polarity_scores(text)["compound"]
         compounds.append(score)
 
-    count = len(compounds)
-    if count == 0:
-        print(
-            f"Finnhub returned {len(articles)} articles for {ticker}, "
-            f"but none had usable text."
-        )
+    if not compounds:
         return None, 0
 
-    avg_compound = sum(compounds) / count
+    avg_compound = round(sum(compounds) / len(compounds), 4)
+
     print(
-        f"Ticker {ticker} ({symbol_for_news}): {count} articles, "
-        f"avg compound={avg_compound:.4f}"
+        f"Ticker {ticker}: {len(compounds)} articles analyzed "
+        f"(max={MAX_ARTICLES_PER_TICKER}), avg={avg_compound}"
     )
-    return round(avg_compound, 4), count
+
+    return avg_compound, len(compounds)
 
 
 def main():
@@ -215,12 +185,12 @@ def main():
 
     tickers = get_tickers(worksheet)
     if not tickers:
-        print("No tickers found in column A.")
+        print("No tickers found.")
         return
 
     finnhub_api_key = os.getenv("FINNHUB_API_KEY")
     if not finnhub_api_key:
-        raise RuntimeError("FINNHUB_API_KEY environment variable is not set.")
+        raise RuntimeError("FINNHUB_API_KEY env var missing.")
 
     analyzer = SentimentIntensityAnalyzer()
     session = requests.Session()
@@ -228,17 +198,15 @@ def main():
     rows_to_write = []
 
     for idx, ticker in enumerate(tickers, start=2):
-        if not ticker:
-            rows_to_write.append(["", 0, datetime.now(timezone.utc).isoformat()])
-            continue
+        print(f"Processing row {idx}: {ticker}")
 
-        print(f"Processing row {idx} ticker {ticker}...")
         compound, count = compute_sentiment_for_ticker(
             session=session,
             analyzer=analyzer,
             ticker=ticker,
             api_key=finnhub_api_key,
         )
+
         timestamp = datetime.now(timezone.utc).isoformat()
 
         if compound is None:
@@ -246,18 +214,14 @@ def main():
         else:
             rows_to_write.append([compound, count, timestamp])
 
-        # Throttle between tickers to avoid hitting per-minute limits
         time.sleep(SECONDS_BETWEEN_REQUESTS)
 
-    # Determine range: from P2 down to R(last_row)
+    # Write P2:Rn
     start_row = 2
     end_row = start_row + len(rows_to_write) - 1
 
-    start_col_index = 16  # P
-    end_col_index = start_col_index + len(HEADER_COLUMNS) - 1  # R
-
-    start_col_letter = col_letter(start_col_index)
-    end_col_letter = col_letter(end_col_index)
+    start_col_letter = col_letter(16)  # P
+    end_col_letter = col_letter(16 + len(HEADER_COLUMNS) - 1)  # R
     update_range = f"{start_col_letter}{start_row}:{end_col_letter}{end_row}"
 
     worksheet.update(update_range, rows_to_write, value_input_option="USER_ENTERED")
