@@ -5,9 +5,7 @@ from datetime import datetime, timedelta, timezone
 import gspread
 from google.oauth2 import service_account
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-
-from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import NewsRequest
+import requests
 
 
 SHEET_NAME = "Active-Investing"
@@ -19,6 +17,9 @@ HEADER_COLUMNS = [
     "Articles_Analyzed",  # Q
     "Last_Updated_UTC",   # R
 ]
+
+# How far back to look for news per ticker (in days)
+NEWS_LOOKBACK_DAYS = 30
 
 
 def col_letter(idx: int) -> str:
@@ -78,59 +79,70 @@ def get_tickers(worksheet: gspread.Worksheet) -> list[str]:
     return tickers
 
 
-def get_news_client() -> NewsClient:
+def normalize_ticker_for_news(ticker: str) -> str:
     """
-    Create Alpaca news client using env vars if available.
+    Optionally normalize symbols (if you use stuff like BTC/USD).
+    For Finnhub company-news this usually wants stock symbols like AAPL, TSLA.
     """
-    api_key = os.getenv("APCA_API_KEY_ID")
-    secret_key = os.getenv("APCA_API_SECRET_KEY")
-
-    if api_key and secret_key:
-        return NewsClient(api_key=api_key, secret_key=secret_key)
-    else:
-        return NewsClient()
+    t = ticker.upper()
+    # If you have crypto pairs, try stripping separators so BTC/USD -> BTC
+    if "/" in t:
+        t = t.split("/")[0]
+    if "-" in t:
+        t = t.split("-")[0]
+    return t
 
 
 def compute_sentiment_for_ticker(
-    news_client: NewsClient,
     analyzer: SentimentIntensityAnalyzer,
     ticker: str,
-    days_back: int = 7,
+    api_key: str,
+    days_back: int = NEWS_LOOKBACK_DAYS,
 ):
     """
-    Fetch recent news for `ticker` and compute VADER sentiment.
+    Fetch recent company news from Finnhub for `ticker` and compute VADER sentiment.
 
     Returns:
         (compound_avg, article_count)
         or (None, 0) if no usable news.
     """
-    now_utc = datetime.now(timezone.utc)
-    start_time = now_utc - timedelta(days=days_back)
+    today = datetime.utcnow().date()
+    from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    to_date = today.strftime("%Y-%m-%d")
 
-    request = NewsRequest(
-        symbols=ticker,
-        start=start_time,
-        limit=50,  # per-ticker cap
-    )
+    symbol_for_news = normalize_ticker_for_news(ticker)
+
+    params = {
+        "symbol": symbol_for_news,
+        "from": from_date,
+        "to": to_date,
+        "token": api_key,
+    }
 
     try:
-        news = news_client.get_news(request)
+        resp = requests.get(
+            "https://finnhub.io/api/v1/company-news",
+            params=params,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        articles = resp.json()
     except Exception as e:
-        print(f"Error fetching news for {ticker}: {e}")
+        print(f"Error fetching Finnhub news for {ticker} ({symbol_for_news}): {e}")
+        return None, 0
+
+    if not isinstance(articles, list) or not articles:
+        print(
+            f"No Finnhub company news for {ticker} ({symbol_for_news}) "
+            f"from {from_date} to {to_date}."
+        )
         return None, 0
 
     compounds = []
 
-    # `news` is iterable; each item usually has headline & summary
-    for article in news:
-        # Be defensive: article can be model or dict depending on version
-        if isinstance(article, dict):
-            headline = article.get("headline", "") or ""
-            summary = article.get("summary", "") or ""
-        else:
-            headline = getattr(article, "headline", "") or ""
-            summary = getattr(article, "summary", "") or ""
-
+    for article in articles:
+        headline = (article.get("headline") or "").strip()
+        summary = (article.get("summary") or "").strip()
         text = (headline + ". " + summary).strip()
         if not text:
             continue
@@ -138,11 +150,20 @@ def compute_sentiment_for_ticker(
         score = analyzer.polarity_scores(text)["compound"]
         compounds.append(score)
 
-    if not compounds:
+    count = len(compounds)
+    if count == 0:
+        print(
+            f"Finnhub returned {len(articles)} articles for {ticker}, "
+            f"but none had usable text."
+        )
         return None, 0
 
-    avg_compound = sum(compounds) / len(compounds)
-    return round(avg_compound, 4), len(compounds)
+    avg_compound = sum(compounds) / count
+    print(
+        f"Ticker {ticker} ({symbol_for_news}): {count} articles, "
+        f"avg compound={avg_compound:.4f}"
+    )
+    return round(avg_compound, 4), count
 
 
 def main():
@@ -154,7 +175,10 @@ def main():
         print("No tickers found in column A.")
         return
 
-    news_client = get_news_client()
+    finnhub_api_key = os.getenv("FINNHUB_API_KEY")
+    if not finnhub_api_key:
+        raise RuntimeError("FINNHUB_API_KEY environment variable is not set.")
+
     analyzer = SentimentIntensityAnalyzer()
 
     rows_to_write = []
@@ -164,7 +188,11 @@ def main():
             rows_to_write.append(["", 0, datetime.now(timezone.utc).isoformat()])
             continue
 
-        compound, count = compute_sentiment_for_ticker(news_client, analyzer, ticker)
+        compound, count = compute_sentiment_for_ticker(
+            analyzer=analyzer,
+            ticker=ticker,
+            api_key=finnhub_api_key,
+        )
         timestamp = datetime.now(timezone.utc).isoformat()
 
         if compound is None:
