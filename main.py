@@ -1,5 +1,6 @@
 import os
 import json
+import time
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -20,6 +21,9 @@ HEADER_COLUMNS = [
 
 # How far back to look for news per ticker (in days)
 NEWS_LOOKBACK_DAYS = 30
+
+# Throttle between requests so we don't spam Finnhub
+SECONDS_BETWEEN_REQUESTS = 1.2
 
 
 def col_letter(idx: int) -> str:
@@ -81,11 +85,14 @@ def get_tickers(worksheet: gspread.Worksheet) -> list[str]:
 
 def normalize_ticker_for_news(ticker: str) -> str:
     """
-    Optionally normalize symbols (if you use stuff like BTC/USD).
-    For Finnhub company-news this usually wants stock symbols like AAPL, TSLA.
+    Normalize symbols for Finnhub company-news.
+
+    Examples:
+      'BTC/USD' -> 'BTC'
+      'ETH-USD' -> 'ETH'
+      'SOLUSD'  -> 'SOLUSD'  (unchanged)
     """
     t = ticker.upper()
-    # If you have crypto pairs, try stripping separators so BTC/USD -> BTC
     if "/" in t:
         t = t.split("/")[0]
     if "-" in t:
@@ -94,6 +101,7 @@ def normalize_ticker_for_news(ticker: str) -> str:
 
 
 def compute_sentiment_for_ticker(
+    session: requests.Session,
     analyzer: SentimentIntensityAnalyzer,
     ticker: str,
     api_key: str,
@@ -101,6 +109,9 @@ def compute_sentiment_for_ticker(
 ):
     """
     Fetch recent company news from Finnhub for `ticker` and compute VADER sentiment.
+
+    Includes basic rate-limit handling: if we get 429, sleep until reset (or 60s)
+    and retry once.
 
     Returns:
         (compound_avg, article_count)
@@ -119,16 +130,48 @@ def compute_sentiment_for_ticker(
         "token": api_key,
     }
 
-    try:
-        resp = requests.get(
-            "https://finnhub.io/api/v1/company-news",
-            params=params,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        articles = resp.json()
-    except Exception as e:
-        print(f"Error fetching Finnhub news for {ticker} ({symbol_for_news}): {e}")
+    url = "https://finnhub.io/api/v1/company-news"
+
+    # Up to 2 attempts: initial + one retry if rate limited
+    for attempt in range(2):
+        try:
+            resp = session.get(url, params=params, timeout=10)
+
+            if resp.status_code == 429:
+                # Rate limited – look for reset header and sleep
+                reset_header = resp.headers.get("X-RateLimit-Reset")
+                if reset_header:
+                    try:
+                        reset_ts = int(reset_header)
+                        now_ts = int(time.time())
+                        wait_secs = max(0, reset_ts - now_ts + 1)
+                    except ValueError:
+                        wait_secs = 60
+                else:
+                    wait_secs = 60
+
+                print(
+                    f"Rate limit hit for {ticker} ({symbol_for_news}), "
+                    f"sleeping {wait_secs}s before retry..."
+                )
+                time.sleep(wait_secs)
+                # Go back to top of loop for retry (only once)
+                continue
+
+            resp.raise_for_status()
+            articles = resp.json()
+            break  # success, exit retry loop
+
+        except requests.HTTPError as e:
+            # If this wasn't 429 or we've already retried, bail out
+            print(f"HTTP error for {ticker} ({symbol_for_news}): {e}")
+            return None, 0
+        except Exception as e:
+            print(f"Error fetching Finnhub news for {ticker} ({symbol_for_news}): {e}")
+            return None, 0
+    else:
+        # If we exit the loop normally (no break), we never succeeded
+        print(f"Failed to fetch Finnhub news for {ticker} after retries.")
         return None, 0
 
     if not isinstance(articles, list) or not articles:
@@ -180,15 +223,18 @@ def main():
         raise RuntimeError("FINNHUB_API_KEY environment variable is not set.")
 
     analyzer = SentimentIntensityAnalyzer()
+    session = requests.Session()
 
     rows_to_write = []
 
-    for ticker in tickers:
+    for idx, ticker in enumerate(tickers, start=2):
         if not ticker:
             rows_to_write.append(["", 0, datetime.now(timezone.utc).isoformat()])
             continue
 
+        print(f"Processing row {idx} ticker {ticker}...")
         compound, count = compute_sentiment_for_ticker(
+            session=session,
             analyzer=analyzer,
             ticker=ticker,
             api_key=finnhub_api_key,
@@ -199,6 +245,9 @@ def main():
             rows_to_write.append(["", 0, timestamp])
         else:
             rows_to_write.append([compound, count, timestamp])
+
+        # Throttle between tickers to avoid hitting per-minute limits
+        time.sleep(SECONDS_BETWEEN_REQUESTS)
 
     # Determine range: from P2 down to R(last_row)
     start_row = 2
