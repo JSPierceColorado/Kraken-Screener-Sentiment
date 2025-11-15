@@ -1,11 +1,10 @@
 import os
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import gspread
 from google.oauth2 import service_account
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests
 
 
@@ -13,20 +12,20 @@ SHEET_NAME = "Active-Investing"
 WORKSHEET_NAME = "Kraken-Screener"
 
 # Columns we will use (P onward). A–O remain untouched.
+# NOTE: Name is kept for backwards compatibility, but the value now comes
+# from CryptoNews sentiment, not VADER.
 HEADER_COLUMNS = [
-    "VADER_Compound",     # P
+    "VADER_Compound",     # P (now: CryptoNews-based sentiment score)
     "Articles_Analyzed",  # Q
     "Last_Updated_UTC",   # R
 ]
 
-# How far back to look for news per ticker (in days)
-NEWS_LOOKBACK_DAYS = 30
+# How far back to look for sentiment via CryptoNews.
+# CryptoNews supports shortcuts like: last7days, last30days, last60days, etc.
+CRYPTO_NEWS_DATE_RANGE = os.getenv("CRYPTO_NEWS_DATE_RANGE", "last30days")
 
-# Throttle between requests so we don't spam Finnhub
+# Throttle between requests so we don't spam the API
 SECONDS_BETWEEN_REQUESTS = 1.2
-
-# Env-var-controlled max articles (default 20)
-MAX_ARTICLES_PER_TICKER = int(os.getenv("MAX_ARTICLES_PER_TICKER", "20"))
 
 
 def col_letter(idx: int) -> str:
@@ -78,7 +77,12 @@ def get_tickers(worksheet: gspread.Worksheet) -> list[str]:
 
 
 def normalize_ticker_for_news(ticker: str) -> str:
-    """Normalize tickers for Finnhub."""
+    """
+    Normalize Kraken-style tickers for CryptoNews.
+    Example:
+      'BTC/USD' -> 'BTC'
+      'ETH-USDT' -> 'ETH'
+    """
     t = ticker.upper()
     if "/" in t:
         t = t.split("/")[0]
@@ -87,96 +91,122 @@ def normalize_ticker_for_news(ticker: str) -> str:
     return t
 
 
-def compute_sentiment_for_ticker(
+def compute_cryptonews_sentiment_for_ticker(
     session: requests.Session,
-    analyzer: SentimentIntensityAnalyzer,
     ticker: str,
-    api_key: str,
-    days_back: int = NEWS_LOOKBACK_DAYS,
+    api_token: str,
+    date_range: str = CRYPTO_NEWS_DATE_RANGE,
 ):
     """
-    Fetch recent company news from Finnhub and compute VADER sentiment.
-    Applies MAX_ARTICLES_PER_TICKER limit.
-    """
-    today = datetime.utcnow().date()
-    from_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    to_date = today.strftime("%Y-%m-%d")
+    Use CryptoNews /api/v1/stat endpoint to get sentiment counts and
+    turn them into a single sentiment score.
 
+    Endpoint pattern (based on docs/examples):
+      https://cryptonews-api.com/api/v1/stat
+        ?tickers=BTC
+        &date=last7days
+        &page=1
+        &token=YOUR_TOKEN
+
+    Response structure (simplified from docs + published examples):
+      {
+        "data": {
+          "2024-01-15": {
+            "BTC": {
+              "Neutral": <int>,
+              "Positive": <int>,
+              "Negative": <int>
+            }
+          },
+          "2024-01-16": { ... },
+          ...
+        },
+        "total_pages": <int>,
+        ...
+      }
+
+    We:
+      - aggregate Neutral/Positive/Negative across all dates & pages
+      - compute sentiment = (Positive - Negative) / (Positive + Negative + Neutral)
+      - return (sentiment_score, total_articles)
+    """
     symbol_for_news = normalize_ticker_for_news(ticker)
 
-    params = {
-        "symbol": symbol_for_news,
-        "from": from_date,
-        "to": to_date,
-        "token": api_key,
-    }
+    base_url = "https://cryptonews-api.com/api/v1/stat"
 
-    url = "https://finnhub.io/api/v1/company-news"
+    total_positive = 0
+    total_negative = 0
+    total_neutral = 0
 
-    # Allow up to 1 retry for 429 rate limits
-    for attempt in range(2):
+    page = 1
+    max_pages_safe_guard = 50  # hard safety cap
+
+    while page <= max_pages_safe_guard:
+        params = {
+            "tickers": symbol_for_news,
+            "date": date_range,
+            "page": page,
+            "token": api_token,
+        }
+
         try:
-            resp = session.get(url, params=params, timeout=10)
-
-            if resp.status_code == 429:
-                reset_header = resp.headers.get("X-RateLimit-Reset")
-                if reset_header:
-                    try:
-                        reset_ts = int(reset_header)
-                        now_ts = int(time.time())
-                        wait_secs = max(0, reset_ts - now_ts + 1)
-                    except ValueError:
-                        wait_secs = 60
-                else:
-                    wait_secs = 60
-
+            resp = session.get(base_url, params=params, timeout=10)
+            # If unauthorized or rate-limited or similar, bail out
+            if resp.status_code != 200:
                 print(
-                    f"429 rate limit for {ticker} — sleeping {wait_secs}s then retrying..."
+                    f"CryptoNews request failed for {ticker} "
+                    f"(page {page}) with status {resp.status_code}: {resp.text[:200]}"
                 )
-                time.sleep(wait_secs)
-                continue
+                break
 
-            resp.raise_for_status()
-            articles = resp.json()
+            payload = resp.json()
+        except Exception as e:
+            print(f"Error fetching CryptoNews sentiment for {ticker}: {e}")
             break
 
-        except Exception as e:
-            print(f"Error fetching Finnhub news for {ticker}: {e}")
-            return None, 0
-    else:
-        print(f"Failed to fetch Finnhub news for {ticker} after retries.")
+        data = payload.get("data") or {}
+        if not data:
+            # No data for this ticker / date range
+            break
+
+        for date_str, per_date in data.items():
+            coin_data = per_date.get(symbol_for_news)
+            if not coin_data:
+                continue
+
+            neutral = coin_data.get("Neutral", 0) or 0
+            positive = coin_data.get("Positive", 0) or 0
+            negative = coin_data.get("Negative", 0) or 0
+
+            total_neutral += neutral
+            total_positive += positive
+            total_negative += negative
+
+        total_pages = payload.get("total_pages", 1)
+        if page >= total_pages:
+            break
+
+        page += 1
+        # Small delay between pages to be polite
+        time.sleep(0.2)
+
+    total_articles = total_neutral + total_positive + total_negative
+    if total_articles == 0:
+        print(f"No CryptoNews sentiment data for {ticker} (date={date_range}).")
         return None, 0
 
-    # No articles
-    if not isinstance(articles, list) or not articles:
-        print(f"No news returned for {ticker}.")
-        return None, 0
-
-    # Apply article limit
-    articles = articles[:MAX_ARTICLES_PER_TICKER]
-
-    compounds = []
-    for article in articles:
-        headline = (article.get("headline") or "").strip()
-        summary = (article.get("summary") or "").strip()
-        text = (headline + ". " + summary).strip()
-        if not text:
-            continue
-
-        score = analyzer.polarity_scores(text)["compound"]
-        compounds.append(score)
-
-    if not compounds:
-        return None, 0
-
-    avg_compound = round(sum(compounds) / len(compounds), 4)
+    # Map counts into a single score ~[-1, 1]
+    sentiment_score = (total_positive - total_negative) / float(total_articles)
+    sentiment_score = round(sentiment_score, 4)
 
     print(
-        f"Ticker {ticker}: {len(compounds)} articles analyzed "
-        f"(max={MAX_ARTICLES_PER_TICKER}), avg={avg_compound}"
+        f"Ticker {ticker} (CryptoNews): "
+        f"{total_articles} articles (P={total_positive}, "
+        f"N={total_negative}, Neu={total_neutral}), "
+        f"score={sentiment_score}"
     )
 
-    return avg_compound, len(compounds)
+    return sentiment_score, total_articles
 
 
 def main():
@@ -188,31 +218,28 @@ def main():
         print("No tickers found.")
         return
 
-    finnhub_api_key = os.getenv("FINNHUB_API_KEY")
-    if not finnhub_api_key:
-        raise RuntimeError("FINNHUB_API_KEY env var missing.")
+    cryptonews_token = os.getenv("CRYPTONEWS_API_TOKEN")
+    if not cryptonews_token:
+        raise RuntimeError("CRYPTONEWS_API_TOKEN env var missing.")
 
-    analyzer = SentimentIntensityAnalyzer()
     session = requests.Session()
-
     rows_to_write = []
 
     for idx, ticker in enumerate(tickers, start=2):
         print(f"Processing row {idx}: {ticker}")
 
-        compound, count = compute_sentiment_for_ticker(
+        sentiment, count = compute_cryptonews_sentiment_for_ticker(
             session=session,
-            analyzer=analyzer,
             ticker=ticker,
-            api_key=finnhub_api_key,
+            api_token=cryptonews_token,
         )
 
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        if compound is None:
+        if sentiment is None:
             rows_to_write.append(["", 0, timestamp])
         else:
-            rows_to_write.append([compound, count, timestamp])
+            rows_to_write.append([sentiment, count, timestamp])
 
         time.sleep(SECONDS_BETWEEN_REQUESTS)
 
@@ -226,7 +253,7 @@ def main():
 
     worksheet.update(update_range, rows_to_write, value_input_option="USER_ENTERED")
 
-    print("Sentiment update complete.")
+    print("CryptoNews sentiment update complete.")
 
 
 if __name__ == "__main__":
